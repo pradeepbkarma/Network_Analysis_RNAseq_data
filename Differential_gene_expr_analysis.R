@@ -51,7 +51,7 @@ diff_exp_genes <- exp_data_imputed%>%
   arrange(desc(log_fold_change))
 
 
-write.csv(diff_exp_genes, "./Data/Diff_expr_genes", row.names = FALSE)
+write.csv(diff_exp_genes, "./Data/Diff_expr_genes.csv", row.names = FALSE)
 #sepsis vs control 
 sepsis_upreg <- diff_exp_genes%>%
   dplyr::select(log_fold_change)%>%

@@ -5,126 +5,144 @@ library(tidyverse)
 library(dplyr)
 library(org.Hs.eg.db)
 library(enrichplot)
+library(DESeq2)
+library(ggplot2)
+library(GENIE3)
+library(tibble)
+library(doParallel)
+library(doRNG)
+library(igraph)
 
-#### load data and reformat data ####
-data <- read_csv('./Data/GDS2808.soft.csv', show_col_types = FALSE)
-exp_data <- data[!duplicated(data$IDENTIFIER),]
-exp_data <- exp_data%>%
-  dplyr::select(-'ID_REF')%>%
-  column_to_rownames(var = 'IDENTIFIER')
+# load counts table from GEO
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path <- paste(urld, "acc=GSE185263", "file=GSE185263_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep="&");
+tbl <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames="GeneID")
 
-#### data preprocessing and filtering ####
-handle_na_values <- function (data){
-  na_counts_per_row <- rowSums(is.na(data))
-  threshold<- ncol(data)/2
-  
-  unwanted_rows <- sum(na_counts_per_row > threshold)
-  print(paste("There are ", unwanted_rows, "rows with more than 50% missing values."))
-  exp_data_clean <- data %>%
-    filter(rowSums(is.na(.)) <= threshold)
-  #apply function over each row
-  return(exp_data_clean)
+# load gene annotations 
+apath <- paste(urld, "type=rnaseq_counts", "file=Human.GRCh38.p13.annot.tsv.gz", sep="&")
+annot <- data.table::fread(apath, header=T, quote="", stringsAsFactors=F, data.table=F)
+rownames(annot) <- annot$GeneID
+
+# sample selection
+gsms <- paste0("00000000000000000000000000000000000000000000000000",
+               "00000000000000000000000000000000000000000000000000",
+               "00000000000000000000000000000000000000000000000000",
+               "00000000000000000000000000000000000000000000000000",
+               "00000000000000000000000000000000000000000000000000",
+               "00000000000000001111111111111111111111111111111111",
+               "11111000000000000000000000000000000000000000000000",
+               "000000000000000000000000000000000000011111")
+sml <- strsplit(gsms, split="")[[1]]
+
+# group membership for samples
+gs <- factor(sml)
+groups <- make.names(c("sepsis","healthy"))
+levels(gs) <- groups
+sample_info <- data.frame(Group = gs, row.names = colnames(tbl))
+
+# pre-filter low count genes
+# keep genes with at least N counts > 10, where N = size of smallest group
+keep <- rowSums( tbl >= 10 ) >= min(table(gs))
+tbl <- tbl[keep, ]
+
+ds <- DESeqDataSetFromMatrix(countData=tbl, colData=sample_info, design= ~Group)
+
+ds <- DESeq(ds, test="Wald", sfType="poscount")
+
+# extract results for top genes table
+r <- results (ds, contrast=c("Group", groups[1], groups[2]), alpha=0.05, pAdjustMethod ="fdr")
+
+tT <- r[order(r$padj)[1:250],] 
+tT <- merge(as.data.frame(tT), annot, by=0, sort=F)
+
+tT <- subset(tT, select=c("GeneID","padj","pvalue","lfcSE","stat","log2FoldChange","baseMean","Symbol","Description"))
+
+########################################################################
+filtered_data <- as.matrix(tbl[rownames(tbl) %in% tT$GeneID, ])
+
+sepsis_cols <- rownames(sample_info)[sample_info$Group == "sepsis"]
+healthy_cols <- rownames(sample_info)[sample_info$Group == "healthy"]
+
+sepsis_data <- filtered_data[, sepsis_cols, drop = FALSE]
+healthy_data <- filtered_data[, healthy_cols, drop = FALSE]
+#write.csv(sepsis_data, "/sepsis_data_185263.csv", row.names = TRUE)
+#write.csv(healthy_data, "/healthy_data_185263.csv", row.names = TRUE)
+#write_csv(tT, "GSE185263_DESeq.csv")
+human_tfs <- read_csv('./Data/human_tfs.csv', show_col_types = FALSE)
+
+deseq_info <- tT
+
+get_en_regulators <- function(data, tfs){
+  target_genes <- row.names(data)
+  is_regulator <- target_genes %in% tfs$Entrez.ID
+  regulatoryGenes <- target_genes[is_regulator]
+  return(regulatoryGenes)
 }
 
-exp_data_filtered <- handle_na_values(exp_data)
-#exp_data_filtered[, 1: 23] are control group [, 24:94] are sepsis group]
-
-replace_na_with_median <- function (row){
-  control_median <- median(row[1:23], na.rm = TRUE)
-  sepsis_median <- median(row[24:94], na.rm = TRUE)
-  row[1:23][is.na(row[1:23])] <- control_median
-  row[24:94][is.na(row[24:94])] <- sepsis_median
-  return(row)
+#function that applies GENIE3
+get_linkList <- function(expr_data, regulatory_genes){
+  weightMat <- GENIE3(expr_data, regulators = regulatory_genes, nCores = 4, verbose = TRUE)
+  linklist <- getLinkList(weightMat)
+  min_weight <- min(linklist$weight)
+  max_weight <- max(linklist$weight)
+  linklist$norm_weight <- (linklist$weight - min_weight) / (max_weight - min_weight)
+  linklist <- linklist%>%
+    dplyr::select(-weight)
+  return(linklist)
 }
 
-exp_data_imputed <- as.data.frame(t(apply(exp_data_filtered, 1, replace_na_with_median)))
+healthy_reg <- get_en_regulators(healthy_data, human_tfs)
+sepsis_reg <- get_en_regulators(sepsis_data, human_tfs)
 
-#### calculate the logfold change ####
-exp_data_imputed$log_fold_change <- apply(exp_data_imputed, 1, function (row){
-  control_mean <- mean(row[1:23])
-  sepsis_mean <- mean(row[24:94])
-  log2(sepsis_mean / control_mean)
-})
+sepsis_linklist <- get_linkList(as.matrix(sepsis_data), sepsis_reg)
 
-diff_exp_genes <- exp_data_imputed%>%
-  filter(!is.na(log_fold_change) & abs(log_fold_change) >= 2.00) %>%
-  arrange(desc(log_fold_change))
+sepsis_toplink <- head(sepsis_linklist, 100)
 
+network_graph_sepsis <- graph_from_data_frame(sepsis_toplink, directed = TRUE)
+# Open a PNG device
+#png("GRN_sepsis_rnaSeq.png", width = 8*300, height = 6*300, res = 300)
 
-write.csv(diff_exp_genes, "./Data/Diff_expr_genes.csv", row.names = FALSE)
-#sepsis vs control 
-sepsis_upreg <- diff_exp_genes%>%
-  dplyr::select(log_fold_change)%>%
-  filter(log_fold_change > 0)
+# Plot the graph
+plot(network_graph_sepsis, vertex.size = 5, 
+     vertex.label.cex = 0.8, edge.arrow.size = 0.5, layout = layout_with_fr,
+     main = "GRN of key genes in sepsis samples")
+healthy_linkList <- get_linkList(as.matrix(healthy_data), healthy_reg)
 
-sepsis_downReg <- diff_exp_genes %>%
-  dplyr::select(log_fold_change)%>%
-  filter(log_fold_change < 0)
+healthy_toplink <- head(healthy_linkList, 100)
+network_graph_healthy <- graph_from_data_frame(healthy_toplink, directed = TRUE)
+#png("GRN_healthy_rnaSeq.png", width = 8*300, height = 6*300, res = 300)
 
-#function for GO enrichment Analysis for upregulated genes 
+# Plot the graph
+plot(network_graph_healthy, vertex.size = 5, 
+     vertex.label.cex = 0.8, edge.arrow.size = 0.5, layout = layout_with_fr,
+     main = "GRN of key genes for sepsis in healthy samples")
 
-get_go_enrichment <- function(expr_data, GO_term){
-  geneList <- expr_data$log_fold_change
-  names(geneList) <- rownames(expr_data)
-  #map the gene names to EntrezID
-  gene_symbols <- names(geneList)
-  entrez_ids <- mapIds(org.Hs.eg.db, keys = gene_symbols,
-                       column = "ENTREZID", keytype = "SYMBOL",
-                       multiVals = "first")
-  #remove NAs and update geneList 
-  valid_entrez_id <- entrez_ids[!is.na(entrez_ids)]
-  geneList <- geneList[names(geneList) %in% names(valid_entrez_id)]
-  names(geneList) <- valid_entrez_id
-  go_result <- get_go_result(geneList, GO_term)
-  return(go_result)
-}
+diff_info <- tT
+diff_data <- diff_info%>%
+  dplyr::select(c(Symbol, log2FoldChange, padj))%>%
+  dplyr::filter(padj <= 0.05 & Symbol != "NA")%>%
+  dplyr::select(-padj)
 
-#function to get go_enrichment 
-get_go_result <- function(geneList, term){
-  result <- enrichGO(gene = names(geneList),
-                     OrgDb = org.Hs.eg.db,
-                     keyType = "ENTREZID",
-                     ont = term,
-                     pAdjustMethod = "BH",
-                     pvalueCutoff = 0.05,
-                     qvalueCutoff = 0.2)
-  return(result)
-}
-barplot(get_go_enrichment(sepsis_upreg, "CC"), title = "GO enrichment for CC in Sepsis upregulated genes")
-barplot(get_go_enrichment(sepsis_downReg, "BP"), title = "GO enrichment for BP in Sepsis Down-regulated genes")
-barplot(get_go_enrichment(sepsis_downReg, "CC"), title = "GO enrichment for CC in Sepsis Down-regulated genes")
+diff_data <- diff_data %>%
+  column_to_rownames(var = "Symbol")
+
+geneList <- diff_data$log2FoldChange
+names(geneList) <- row.names(diff_data)
+gene_symbol <- rownames(diff_data)
 
 
-#There is no significant enrichment of Molecular Functions and Biological Processes
-#for the upregulated genes in sepsis 
-# and there are no significant enrichment for Molecular Functions and Cellular Components for 
-#down-regulated sepsis genes 
+entrez_ids <- mapIds(org.Hs.eg.db, keys = gene_symbol,
+                     column = "ENTREZID", keytype = "SYMBOL",
+                     multiVals = "first")
 
-#now let's do same thing for differential gene expression in control 
-exp_data_control <- exp_data_imputed%>%
-  dplyr::select(-log_fold_change)
-exp_data_control$log_fold_change <- apply(exp_data_control, 1, function(row){
-  control_mean <- mean(row[1:23])
-  sepsis_mean <- mean(row[24:94])
-  log2(control_mean/sepsis_mean)
-})
-#now filtered upregulated or downregulated genes 
-diff_exp_control_genes <- exp_data_control%>%
-  filter(!is.na(log_fold_change) & abs(log_fold_change) >= 2.00) %>%
-  arrange(desc(log_fold_change))
+result <- enrichGO(gene = names(geneList),
+                   OrgDb = org.Hs.eg.db,
+                   keyType = "ENTREZID",
+                   ont = "MF",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.2)
 
-#head(diff_exp_control_genes)
-control_upreg <- diff_exp_control_genes%>%
-  dplyr::select(log_fold_change)%>%
-  filter(log_fold_change > 0)
-control_downReg <- diff_exp_control_genes%>%
-  dplyr::select(log_fold_change)%>%
-  filter(log_fold_change < 0)
+barplot(result, title = "GO enrichment of Molecular Function")
 
-#Now barplots for GO Enrichment in control genes 
-barplot(get_go_enrichment(control_upreg, "BP"), title = "GO enrichment for BP in Control upregulated genes")
-barplot(get_go_enrichment(control_upreg, "CC"), title = "GO enrichment for CC in Control upregulated genes")
-
-barplot(get_go_enrichment(control_downReg, "MF"), title = "GO enrichment for MF in Control down_regulated genes")
-barplot(get_go_enrichment(control_downReg, "CC"), title = "GO enrichment for CC in Control down_regulated genes")
-
+#change to other biological terms for other GO enrichment analysis like "BP", "CC"
